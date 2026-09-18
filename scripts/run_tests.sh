@@ -27,6 +27,12 @@ COLLECTION_DIR="${COLLECTION_DIR:-${REPO_ROOT}/Postman}"
 REPORT_DIR="${REPO_ROOT}/newman-reports"
 mkdir -p "$REPORT_DIR"
 
+# Collections are rewritten into this directory before they run, so that the
+# <WSO2_SERVER_URL> placeholders baked into their collection variables point at
+# the server under test. See prepare_collection().
+PREPARED_DIR="$(mktemp -d)"
+trap 'rm -rf "$PREPARED_DIR"' EXIT
+
 # -------------------------------------------------------
 # Helper functions
 # -------------------------------------------------------
@@ -84,9 +90,17 @@ install_prerequisites() {
         log "jq $(jq --version) already installed. Skipping."
     fi
 
+    # --- Configure a user-local npm prefix to avoid permission issues ---
+    NPM_GLOBAL_PREFIX="${HOME}/.npm-global"
+    mkdir -p "${NPM_GLOBAL_PREFIX}"
+    npm config set prefix "${NPM_GLOBAL_PREFIX}"
+    NPM_GLOBAL_BIN="${NPM_GLOBAL_PREFIX}/bin"
+    export PATH="${NPM_GLOBAL_BIN}:${PATH}"
+    log "npm global prefix set to: ${NPM_GLOBAL_PREFIX}"
+
     # --- newman ---
     if ! command -v newman >/dev/null 2>&1; then
-        log "newman not found. Installing globally via npm..."
+        log "newman not found. Installing into ${NPM_GLOBAL_PREFIX}..."
         npm install -g newman
     else
         log "newman $(newman --version) already installed. Skipping."
@@ -94,11 +108,15 @@ install_prerequisites() {
 
     # --- newman-reporter-htmlextra ---
     if ! npm list -g newman-reporter-htmlextra --depth=0 >/dev/null 2>&1; then
-        log "newman-reporter-htmlextra not found. Installing globally via npm..."
+        log "newman-reporter-htmlextra not found. Installing into ${NPM_GLOBAL_PREFIX}..."
         npm install -g newman-reporter-htmlextra
     else
         log "newman-reporter-htmlextra already installed. Skipping."
     fi
+
+    # Final check — fail early with a clear message if newman is still not found
+    command -v newman >/dev/null 2>&1 || \
+        fail "newman still not found after installation. Ensure '${NPM_GLOBAL_BIN}' is on your PATH."
 
     log "All prerequisites satisfied."
 }
@@ -121,18 +139,40 @@ wait_for_is() {
     sleep "$DELAY_BEFORE_TESTS"
 }
 
+# The collections carry "<WSO2_SERVER_URL>" in their collection-scope variables.
+# Requests interpolate {{serverUrl}}, which --env-var can override, but the
+# pre-request scripts read pm.collectionVariables.get("token_url") directly and
+# the collection scope is never touched by --env-var. Substitute the real host
+# into a throwaway copy instead.
+prepare_collection() {
+    local src="$1" dst="$2"
+    sed -e "s|<WSO2_SERVER_URL>|${SERVER_URL}|g" \
+        -e "s|https://${SERVER_URL}/t/carbon.super/oauth2/token|${TOKEN_URL}|g" \
+        "$src" > "$dst"
+
+    if grep -q "<WSO2_SERVER_URL>" "$dst"; then
+        fail "Failed to substitute <WSO2_SERVER_URL> in $(basename "$src")."
+    fi
+}
+
 run_collection() {
     local collection_file="$1"
     local collection_name
     collection_name="$(basename "$collection_file" .json)"
+
+    local prepared="${PREPARED_DIR}/$(basename "$collection_file")"
+    prepare_collection "$collection_file" "$prepared"
     local report_html="${REPORT_DIR}/${collection_name}-report.html"
     local report_json="${REPORT_DIR}/${collection_name}-results.json"
 
     log "Running collection: ${collection_name}"
 
     local rc=0
-    newman run "$collection_file" \
+    # The prepared copy lives in a temp dir, so relative formdata file paths
+    # (files/networkUtils.js) have to resolve against the real collection dir.
+    newman run "$prepared" \
         --insecure \
+        --working-dir "${COLLECTION_DIR}" \
         --timeout-request 30000 \
         --env-var "serverUrl=${SERVER_URL}" \
         --env-var "tenantDomain=${TENANT_DOMAIN}" \
@@ -168,13 +208,33 @@ install_prerequisites
 
 wait_for_is
 
-# Run the setup script first (creates the app and assigns API resources)
+# Remove artifacts left behind by an earlier run. The collections create
+# resources under fixed names, so leftovers make the next run's create steps
+# fail with 409. Set SKIP_CLEANUP=1 to keep them.
+if [[ "${SKIP_CLEANUP:-0}" == "1" ]]; then
+    log "SKIP_CLEANUP=1 set. Leaving existing test artifacts in place."
+elif [[ -f "${SCRIPT_DIR}/cleanup_test_artifacts.sh" ]]; then
+    log "Cleaning up artifacts from previous runs..."
+    SERVER_URL="${SERVER_URL}" TENANT_DOMAIN="${TENANT_DOMAIN}" \
+        IS_USERNAME="${IS_USERNAME}" IS_PASSWORD="${IS_PASSWORD}" \
+        bash "${SCRIPT_DIR}/cleanup_test_artifacts.sh" \
+        || log "WARNING: Cleanup reported problems. Continuing anyway."
+else
+    log "WARNING: Cleanup script not found at ${SCRIPT_DIR}/cleanup_test_artifacts.sh. Skipping."
+fi
+
+# Run the setup script (creates the token app and authorizes the API resources
+# whose scopes every request in the collections depends on). A failure here is
+# fatal: without those scopes the tokens are issued but carry no permissions,
+# and the whole suite fails with 403s that look like server faults.
 if [[ -f "${SCRIPT_DIR}/create_and_assign_api_resources.sh" ]]; then
     log "Running setup: create_and_assign_api_resources.sh..."
-    SERVER_URL="${SERVER_URL}" bash "${SCRIPT_DIR}/create_and_assign_api_resources.sh"
+    if ! SERVER_URL="${SERVER_URL}" bash "${SCRIPT_DIR}/create_and_assign_api_resources.sh"; then
+        fail "Setup failed. The test app would have no authorized scopes, so every request would return 403. Aborting."
+    fi
     log "Setup completed."
 else
-    log "WARNING: Setup script not found at ${SCRIPT_DIR}/create_and_assign_api_resources.sh. Skipping."
+    fail "Setup script not found at ${SCRIPT_DIR}/create_and_assign_api_resources.sh. The suite cannot authenticate without it."
 fi
 
 # Run collections
